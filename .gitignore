@@ -1,0 +1,8 @@
+build/
+build-*/
+shaders/*.spv
+imgui.ini
+.vs/
+.cache/
+*.docx
+*REPORT*.md
