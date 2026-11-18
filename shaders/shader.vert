@@ -2,9 +2,11 @@
 
 layout(location = 0) in vec3 inPosition;
 layout(location = 1) in vec3 inNormal;
+layout(location = 2) in vec2 inUV;
 
 layout(location = 0) out vec3 fragWorldPos;
 layout(location = 1) out vec3 fragWorldNormal;
+layout(location = 2) out vec2 fragUV;
 
 layout(set = 0, binding = 0) uniform SceneUBO {
     mat4 viewProj;
@@ -20,10 +22,11 @@ layout(set = 0, binding = 0) uniform SceneUBO {
     int pad1;
 } scene;
 
+// Set 1: Material / Model (Dynamic Uniform Buffer)
 layout(set = 1, binding = 0) uniform ModelUBO {
     mat4 model;
-    mat4 normalMatrix; // 16-byte aligned mat4, upper 3x3 used for normals
-    vec4 albedo;       // rgb = diffuse color, w = opacity
+    mat4 normalMatrix; // mat4 for std140 alignment, upper 3x3 used for normals
+    vec4 albedo;       // rgb = tint/base color, w = unused
     vec4 specular;     // rgb = specular color, w = shininess
 } modelData;
 
@@ -31,5 +34,6 @@ void main() {
     vec4 worldPos = modelData.model * vec4(inPosition, 1.0);
     fragWorldPos = worldPos.xyz;
     fragWorldNormal = normalize(mat3(modelData.normalMatrix) * inNormal);
+    fragUV = inUV;
     gl_Position = scene.viewProj * worldPos;
 }

@@ -17,6 +17,26 @@ inline float degrees(float rad) {
 }
 
 // -------------------------------------------------------------
+// vec2
+// -------------------------------------------------------------
+struct vec2 {
+    float x = 0.0f;
+    float y = 0.0f;
+
+    vec2() = default;
+    vec2(float val) : x(val), y(val) {}
+    vec2(float _x, float _y) : x(_x), y(_y) {}
+
+    float& operator[](int i) { return (&x)[i]; }
+    const float& operator[](int i) const { return (&x)[i]; }
+
+    vec2 operator+(const vec2& b) const { return {x + b.x, y + b.y}; }
+    vec2 operator-(const vec2& b) const { return {x - b.x, y - b.y}; }
+    vec2 operator*(float s) const { return {x * s, y * s}; }
+    vec2 operator/(float s) const { return {x / s, y / s}; }
+};
+
+// -------------------------------------------------------------
 // vec3
 // -------------------------------------------------------------
 struct vec3 {
