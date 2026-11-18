@@ -389,7 +389,7 @@ Context context;
 bool initialize(GLFWwindow* const window) {
 	vkb::InstanceBuilder ib;
 
-	auto ibr = ib.require_api_version(VK_MAKE_VERSION(1, 1, 0))
+	auto ibr = ib.require_api_version(VK_MAKE_VERSION(1, 3, 0))
 				 .request_validation_layers()
 				 .build();
 
@@ -404,10 +404,15 @@ bool initialize(GLFWwindow* const window) {
 		return false;
 	}
 
+	VkPhysicalDeviceVulkan13Features features13 = {};
+	features13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+	features13.dynamicRendering = VK_TRUE;
+
 	vkb::PhysicalDeviceSelector pds(vkb_instance, vk_surface);
 
 	auto pds_result = pds.prefer_gpu_device_type(vkb::PreferredDeviceType::discrete)
 						 .require_present()
+						 .set_required_features_13(features13)
 						 .select();
 	if (!pds_result) {
 		std::cerr << pds_result.error().message() << '\n';
@@ -782,12 +787,14 @@ void submitAndPresent() {
 	};
 
 	VkResult result = vkQueuePresentKHR(context.graphics_queue, &present);
-	if (result == VK_ERROR_OUT_OF_DATE_KHR ||
-	    result == VK_SUBOPTIMAL_KHR ||
-	    vk_swapchain_resize_require) {
+	if (result == VK_SUCCESS) {
+		if (vk_swapchain_resize_require) {
+			rebuildSwapchain(vk_swapchain_resize_width, vk_swapchain_resize_height);
+		}
+	} else if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {
 		rebuildSwapchain(vk_swapchain_resize_width, vk_swapchain_resize_height);
 	} else {
-		std::cerr << "Failed to present Vulkan swapchain image\n";
+		std::cerr << "Failed to present Vulkan swapchain image, VkResult: " << result << '\n';
 	}
 }
 

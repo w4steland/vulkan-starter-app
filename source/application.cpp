@@ -49,10 +49,12 @@ struct SceneUniforms {
   alignas(16) glm::mat4 viewProj;
   alignas(16) glm::mat4 view;
   alignas(16) glm::mat4 proj;
+  alignas(16) glm::mat4 shadowViewProj; // Матрица источника света (вид * ортографическая проекция)
   alignas(16) glm::vec4 cameraPos;
   alignas(16) glm::vec4 ambientLight;  // rgb = цвет, w = интенсивность
   alignas(16) glm::vec4 dirLightDir;   // xyz = направление к сцене, w = интенсивность
   alignas(16) glm::vec4 dirLightColor; // rgb = цвет, w = 1.0 (вкл) / 0.0 (выкл)
+  alignas(16) glm::vec4 shadowParams;  // x = depthBiasConstant, y = depthBiasSlope, z = orthoSize, w = shaderBias
   alignas(4) int numPointLights;
   alignas(4) int numSpotLights;
   alignas(4) int pad0;
@@ -86,7 +88,7 @@ struct Texture {
 };
 
 // -------------------------------------------------------------
-// Геометрия параллелепипеда (Вариант 3: a = 1.6, b = 1.0, c = 0.8)
+// Геометрия: параллелепипед (Вариант 3) + плоскость пола (Лаб 4)
 // -------------------------------------------------------------
 const float hx = 0.8f;
 const float hy = 0.5f;
@@ -95,8 +97,13 @@ const float hz = 0.4f;
 static std::vector<Vertex> vertices;
 static std::vector<uint16_t> indices;
 
-// Процедурная генерация вершин, нормалей и UV для 6 граней
-static void generateParallelepiped(float halfX, float halfY, float halfZ) {
+static uint32_t cubeIndexCount = 0;
+static uint32_t cubeIndexOffset = 0;
+static uint32_t floorIndexCount = 0;
+static uint32_t floorIndexOffset = 0;
+
+// Процедурная генерация вершин, нормалей и UV для параллелепипеда и пола
+static void generateGeometry(float halfX, float halfY, float halfZ) {
   vertices.clear();
   indices.clear();
 
@@ -104,7 +111,7 @@ static void generateParallelepiped(float halfX, float halfY, float halfZ) {
     glm::vec3 p0, p1, p2, p3;
   };
 
-  // 6 граней, каждая задается 4 точками в порядке обхода CCW
+  // 1. Параллелепипед: 6 граней, каждая задается 4 точками в порядке обхода CCW
   std::array<Quad, 6> quads = {{
       // Перед (+Z)
       {{-halfX, -halfY, halfZ}, {halfX, -halfY, halfZ}, {halfX, halfY, halfZ}, {-halfX, halfY, halfZ}},
@@ -120,7 +127,6 @@ static void generateParallelepiped(float halfX, float halfY, float halfZ) {
       {{-halfX, -halfY, -halfZ}, {halfX, -halfY, -halfZ}, {halfX, -halfY, halfZ}, {-halfX, -halfY, halfZ}},
   }};
 
-  // UV-координаты для четырех углов грани
   const glm::vec2 uvs[4] = {
       {0.0f, 1.0f}, // нижний левый
       {1.0f, 1.0f}, // нижний правый
@@ -128,9 +134,9 @@ static void generateParallelepiped(float halfX, float halfY, float halfZ) {
       {0.0f, 0.0f}  // верхний левый
   };
 
+  cubeIndexOffset = 0;
   for (size_t i = 0; i < quads.size(); ++i) {
     const auto &q = quads[i];
-    // Процедурный расчет нормали через векторное произведение
     glm::vec3 normal = glm::normalize(glm::cross(q.p1 - q.p0, q.p2 - q.p0));
 
     uint16_t baseIdx = static_cast<uint16_t>(vertices.size());
@@ -139,7 +145,6 @@ static void generateParallelepiped(float halfX, float halfY, float halfZ) {
     vertices.push_back({q.p2, normal, uvs[2]});
     vertices.push_back({q.p3, normal, uvs[3]});
 
-    // Два треугольника на грань
     indices.push_back(baseIdx + 0);
     indices.push_back(baseIdx + 1);
     indices.push_back(baseIdx + 2);
@@ -148,6 +153,29 @@ static void generateParallelepiped(float halfX, float halfY, float halfZ) {
     indices.push_back(baseIdx + 2);
     indices.push_back(baseIdx + 3);
   }
+  cubeIndexCount = static_cast<uint32_t>(indices.size());
+
+  // 2. Плоскость пола (Floor Plane): горизонтальная плоскость нормалью вверх (0, 1, 0)
+  floorIndexOffset = static_cast<uint32_t>(indices.size());
+  uint16_t fBase = static_cast<uint16_t>(vertices.size());
+  float fSize = 12.0f;
+  float uvRepeat = 6.0f; // повторяемость текстуры для пола
+  glm::vec3 upNormal(0.0f, 1.0f, 0.0f);
+
+  vertices.push_back({{-fSize, 0.0f,  fSize}, upNormal, {0.0f, uvRepeat}});
+  vertices.push_back({{ fSize, 0.0f,  fSize}, upNormal, {uvRepeat, uvRepeat}});
+  vertices.push_back({{ fSize, 0.0f, -fSize}, upNormal, {uvRepeat, 0.0f}});
+  vertices.push_back({{-fSize, 0.0f, -fSize}, upNormal, {0.0f, 0.0f}});
+
+  indices.push_back(fBase + 0);
+  indices.push_back(fBase + 1);
+  indices.push_back(fBase + 2);
+
+  indices.push_back(fBase + 0);
+  indices.push_back(fBase + 2);
+  indices.push_back(fBase + 3);
+
+  floorIndexCount = static_cast<uint32_t>(indices.size()) - floorIndexOffset;
 }
 
 // -------------------------------------------------------------
@@ -192,6 +220,36 @@ static std::vector<VkDescriptorSet> descSetsModel; // отдельный descrip
 
 static VkPipelineLayout pipeLayout = VK_NULL_HANDLE;
 static VkPipeline pipeline = VK_NULL_HANDLE;
+
+// -------------------------------------------------------------
+// Ресурсы и функции Shadow Mapping (Dynamic Rendering, Vulkan 1.3)
+// -------------------------------------------------------------
+static const uint32_t SHADOW_MAP_SIZE = 2048;
+static VkFormat shadowDepthFormat = VK_FORMAT_UNDEFINED;
+static VkImage shadowImage = VK_NULL_HANDLE;
+static VmaAllocation shadowAlloc = VK_NULL_HANDLE;
+static VkImageView shadowImageView = VK_NULL_HANDLE;
+static VkSampler shadowSampler = VK_NULL_HANDLE;
+
+static VkPipeline shadowPipeline = VK_NULL_HANDLE;
+
+// Указатели на функции Vulkan 1.3 Dynamic Rendering
+static PFN_vkCmdBeginRendering pfnCmdBeginRendering = nullptr;
+static PFN_vkCmdEndRendering pfnCmdEndRendering = nullptr;
+
+// Параметры теней и ортографической проекции
+static float shadowOrthoSize = 6.0f;          // полуразмер покрытия ортографической проекции
+static float shadowNear = 0.5f;               // ближняя плоскость света
+static float shadowFar = 30.0f;               // дальняя плоскость света
+static float shadowLightDistance = 10.0f;     // расстояние виртуальной камеры света от центра сцены
+static float depthBiasConstant = 1.25f;       // аппаратный сдвиг глубины: константа
+static float depthBiasSlope = 1.75f;          // аппаратный сдвиг глубины: наклон
+static float shaderBias = 0.0015f;            // программный сдвиг глубины в фрагментном шейдере
+
+// Параметры пола
+static float floorY = -0.8f;                  // высота плоскости пола по Y
+static int floorTexture = 1;                  // текстура пола (по умолчанию процедурная сетка)
+static float floorColor[3] = {0.85f, 0.85f, 0.85f}; // цвет пола
 
 // -------------------------------------------------------------
 // Параметры сцены, камеры, модели и освещения
@@ -322,6 +380,25 @@ static VkShaderModule makeShaderModule(const std::vector<char> &code) {
   VkShaderModule mod = VK_NULL_HANDLE;
   vkCreateShaderModule(graphics::internal::context.device, &ci, nullptr, &mod);
   return mod;
+}
+
+// Выбор формата глубины для карты теней (должен поддерживать Depth Attachment и Sampled Image)
+static VkFormat findShadowDepthFormat(VkPhysicalDevice physDevice) {
+  const VkFormat candidates[] = {
+    VK_FORMAT_D32_SFLOAT,
+    VK_FORMAT_D32_SFLOAT_S8_UINT,
+    VK_FORMAT_D24_UNORM_S8_UINT,
+    VK_FORMAT_D16_UNORM
+  };
+  for (VkFormat format : candidates) {
+    VkFormatProperties props{};
+    vkGetPhysicalDeviceFormatProperties(physDevice, format, &props);
+    if ((props.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) &&
+        (props.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) {
+      return format;
+    }
+  }
+  return VK_FORMAT_D32_SFLOAT;
 }
 
 // Одноразовый буфер команд для staging операций
@@ -679,8 +756,8 @@ bool initialize() {
     return false;
   }
 
-  // 1. Процедурная генерация вершин, нормалей и UV
-  generateParallelepiped(hx, hy, hz);
+  // 1. Процедурная генерация геометрии (параллелепипед + плоскость пола)
+  generateGeometry(hx, hy, hz);
 
   // 2. Создание буферов вершин и индексов в VRAM (Device Local через Staging)
   VkDeviceSize vertSize = sizeof(vertices[0]) * vertices.size();
@@ -737,10 +814,83 @@ bool initialize() {
     return false;
   }
 
+  // 4.1. Создание ресурсов Shadow Map (динамический рендеринг вне экрана)
+  shadowDepthFormat = findShadowDepthFormat(ctx.physical_device);
+
+  VkImageCreateInfo shadowImgInfo = {};
+  shadowImgInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+  shadowImgInfo.imageType = VK_IMAGE_TYPE_2D;
+  shadowImgInfo.format = shadowDepthFormat;
+  shadowImgInfo.extent = {SHADOW_MAP_SIZE, SHADOW_MAP_SIZE, 1};
+  shadowImgInfo.mipLevels = 1;
+  shadowImgInfo.arrayLayers = 1;
+  shadowImgInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+  shadowImgInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+  shadowImgInfo.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+  shadowImgInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  shadowImgInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+  VmaAllocationCreateInfo shadowAllocInfo = {};
+  shadowAllocInfo.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+
+  if (vmaCreateImage(ctx.allocator, &shadowImgInfo, &shadowAllocInfo, &shadowImage, &shadowAlloc, nullptr) != VK_SUCCESS) {
+    std::cerr << "Failed to allocate shadow map image\n";
+    return false;
+  }
+
+  VkImageViewCreateInfo shadowViewInfo = {};
+  shadowViewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+  shadowViewInfo.image = shadowImage;
+  shadowViewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  shadowViewInfo.format = shadowDepthFormat;
+  shadowViewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+  shadowViewInfo.subresourceRange.baseMipLevel = 0;
+  shadowViewInfo.subresourceRange.levelCount = 1;
+  shadowViewInfo.subresourceRange.baseArrayLayer = 0;
+  shadowViewInfo.subresourceRange.layerCount = 1;
+
+  if (vkCreateImageView(ctx.device, &shadowViewInfo, nullptr, &shadowImageView) != VK_SUCCESS) {
+    std::cerr << "Failed to create shadow map image view\n";
+    return false;
+  }
+
+  // Создаем специальный сэмплер с аппаратным сравнением глубины (Lecture 8 Slide 14)
+  VkSamplerCreateInfo samplerInfo = {};
+  samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+  samplerInfo.magFilter = VK_FILTER_LINEAR;
+  samplerInfo.minFilter = VK_FILTER_LINEAR;
+  samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+  samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+  samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+  samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+  samplerInfo.compareEnable = VK_TRUE;
+  samplerInfo.compareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+  samplerInfo.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
+
+  if (vkCreateSampler(ctx.device, &samplerInfo, nullptr, &shadowSampler) != VK_SUCCESS) {
+    std::cerr << "Failed to create shadow sampler\n";
+    return false;
+  }
+
+  // Получаем адреса функций Dynamic Rendering Vulkan 1.3
+  pfnCmdBeginRendering = (PFN_vkCmdBeginRendering)vkGetDeviceProcAddr(ctx.device, "vkCmdBeginRendering");
+  if (!pfnCmdBeginRendering) {
+    pfnCmdBeginRendering = (PFN_vkCmdBeginRendering)vkGetDeviceProcAddr(ctx.device, "vkCmdBeginRenderingKHR");
+  }
+  pfnCmdEndRendering = (PFN_vkCmdEndRendering)vkGetDeviceProcAddr(ctx.device, "vkCmdEndRendering");
+  if (!pfnCmdEndRendering) {
+    pfnCmdEndRendering = (PFN_vkCmdEndRendering)vkGetDeviceProcAddr(ctx.device, "vkCmdEndRenderingKHR");
+  }
+
+  if (!pfnCmdBeginRendering || !pfnCmdEndRendering) {
+    std::cerr << "Failed to obtain Vulkan Dynamic Rendering function pointers!\n";
+    return false;
+  }
+
   // 5. Описание дескрипторов
 
-  // Набор 0: Сцена (Binding 0: Scene UBO, Binding 1: Point Lights SSBO, Binding 2: Spot Lights SSBO)
-  VkDescriptorSetLayoutBinding sceneBindings[3] = {};
+  // Набор 0: Сцена (Binding 0: Scene UBO, Binding 1: Point Lights SSBO, Binding 2: Spot Lights SSBO, Binding 3: Shadow Map Sampler)
+  VkDescriptorSetLayoutBinding sceneBindings[4] = {};
 
   sceneBindings[0].binding = 0;
   sceneBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -757,9 +907,14 @@ bool initialize() {
   sceneBindings[2].descriptorCount = 1;
   sceneBindings[2].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
 
+  sceneBindings[3].binding = 3;
+  sceneBindings[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+  sceneBindings[3].descriptorCount = 1;
+  sceneBindings[3].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
   VkDescriptorSetLayoutCreateInfo sceneLayoutInfo = {};
   sceneLayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-  sceneLayoutInfo.bindingCount = 3;
+  sceneLayoutInfo.bindingCount = 4;
   sceneLayoutInfo.pBindings = sceneBindings;
 
   if (vkCreateDescriptorSetLayout(ctx.device, &sceneLayoutInfo, nullptr, &descLayoutScene) != VK_SUCCESS) {
@@ -788,7 +943,7 @@ bool initialize() {
     return false;
   }
 
-  // 6. Descriptor Pool (Scene UBO + SSBOs + Dynamic UBOs + Texture Samplers)
+  // 6. Descriptor Pool (Scene UBO + SSBOs + Dynamic UBOs + Texture Samplers + Shadow Sampler)
   VkDescriptorPoolSize poolSizes[4] = {};
   poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
   poolSizes[0].descriptorCount = 1;
@@ -797,7 +952,7 @@ bool initialize() {
   poolSizes[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
   poolSizes[2].descriptorCount = static_cast<uint32_t>(textures.size());
   poolSizes[3].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-  poolSizes[3].descriptorCount = static_cast<uint32_t>(textures.size());
+  poolSizes[3].descriptorCount = static_cast<uint32_t>(textures.size()) + 1; // +1 для Shadow Map
 
   VkDescriptorPoolCreateInfo poolInfo = {};
   poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -833,7 +988,12 @@ bool initialize() {
   spotLightBufInfo.offset = 0;
   spotLightBufInfo.range = spotLightBufSize;
 
-  VkWriteDescriptorSet sceneWrites[3] = {};
+  VkDescriptorImageInfo shadowDescInfo = {};
+  shadowDescInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  shadowDescInfo.imageView = shadowImageView;
+  shadowDescInfo.sampler = shadowSampler;
+
+  VkWriteDescriptorSet sceneWrites[4] = {};
   sceneWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
   sceneWrites[0].dstSet = descSetScene;
   sceneWrites[0].dstBinding = 0;
@@ -855,7 +1015,14 @@ bool initialize() {
   sceneWrites[2].descriptorCount = 1;
   sceneWrites[2].pBufferInfo = &spotLightBufInfo;
 
-  vkUpdateDescriptorSets(ctx.device, 3, sceneWrites, 0, nullptr);
+  sceneWrites[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+  sceneWrites[3].dstSet = descSetScene;
+  sceneWrites[3].dstBinding = 3;
+  sceneWrites[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+  sceneWrites[3].descriptorCount = 1;
+  sceneWrites[3].pImageInfo = &shadowDescInfo;
+
+  vkUpdateDescriptorSets(ctx.device, 4, sceneWrites, 0, nullptr);
 
   // 8. Выделение Descriptor Sets для каждого материала / текстуры (Set 1)
   descSetsModel.resize(textures.size());
@@ -1027,6 +1194,69 @@ bool initialize() {
   vkDestroyShaderModule(ctx.device, fMod, nullptr);
   vkDestroyShaderModule(ctx.device, vMod, nullptr);
 
+  // 11. Создание конвейера для Shadow Mapping (Dynamic Rendering, Lecture 8 Slides 11-13)
+  auto sCode = loadShader("shadow.vert.spv");
+  VkShaderModule sMod = makeShaderModule(sCode);
+  if (!sMod) {
+    std::cerr << "Failed to load shadow.vert.spv!\n";
+    return false;
+  }
+
+  VkPipelineShaderStageCreateInfo shadowStage = {};
+  shadowStage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  shadowStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
+  shadowStage.module = sMod;
+  shadowStage.pName = "main";
+
+  VkPipelineRenderingCreateInfo shadowFormatInfo = {};
+  shadowFormatInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+  shadowFormatInfo.depthAttachmentFormat = shadowDepthFormat;
+
+  VkDynamicState shadowDynStates[] = {
+    VK_DYNAMIC_STATE_VIEWPORT,
+    VK_DYNAMIC_STATE_SCISSOR,
+    VK_DYNAMIC_STATE_DEPTH_BIAS
+  };
+  VkPipelineDynamicStateCreateInfo shadowDynState = {};
+  shadowDynState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+  shadowDynState.dynamicStateCount = 3;
+  shadowDynState.pDynamicStates = shadowDynStates;
+
+  VkPipelineRasterizationStateCreateInfo shadowRaster = {};
+  shadowRaster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+  shadowRaster.polygonMode = VK_POLYGON_MODE_FILL;
+  shadowRaster.lineWidth = 1.0f;
+  shadowRaster.cullMode = VK_CULL_MODE_NONE;
+  shadowRaster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+  shadowRaster.depthBiasEnable = VK_TRUE; // Включаем смещение при записи глубины
+
+  VkPipelineColorBlendStateCreateInfo shadowBlend = {};
+  shadowBlend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+  shadowBlend.attachmentCount = 0;
+
+  VkGraphicsPipelineCreateInfo shadowPipeInfo = {};
+  shadowPipeInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+  shadowPipeInfo.pNext = &shadowFormatInfo; // dynamic rendering
+  shadowPipeInfo.stageCount = 1;            // только вершинный шейдер!
+  shadowPipeInfo.pStages = &shadowStage;
+  shadowPipeInfo.pVertexInputState = &vInput;
+  shadowPipeInfo.pInputAssemblyState = &triAssembly;
+  shadowPipeInfo.pViewportState = &vpState;
+  shadowPipeInfo.pRasterizationState = &shadowRaster;
+  shadowPipeInfo.pMultisampleState = &ms;
+  shadowPipeInfo.pDepthStencilState = &ds;
+  shadowPipeInfo.pColorBlendState = &shadowBlend;
+  shadowPipeInfo.pDynamicState = &shadowDynState;
+  shadowPipeInfo.layout = pipeLayout;
+  shadowPipeInfo.renderPass = VK_NULL_HANDLE; // без VkRenderPass!
+
+  if (vkCreateGraphicsPipelines(ctx.device, VK_NULL_HANDLE, 1, &shadowPipeInfo, nullptr, &shadowPipeline) != VK_SUCCESS) {
+    std::cerr << "Failed to create shadow graphics pipeline!\n";
+    return false;
+  }
+
+  vkDestroyShaderModule(ctx.device, sMod, nullptr);
+
   return true;
 }
 
@@ -1037,6 +1267,15 @@ bool initialize() {
 void shutdown() {
   auto &ctx = graphics::internal::context;
   vkQueueWaitIdle(ctx.graphics_queue);
+
+  if (shadowPipeline)
+    vkDestroyPipeline(ctx.device, shadowPipeline, nullptr);
+  if (shadowSampler)
+    vkDestroySampler(ctx.device, shadowSampler, nullptr);
+  if (shadowImageView)
+    vkDestroyImageView(ctx.device, shadowImageView, nullptr);
+  if (shadowImage)
+    vmaDestroyImage(ctx.allocator, shadowImage, shadowAlloc);
 
   if (pipeline)
     vkDestroyPipeline(ctx.device, pipeline, nullptr);
@@ -1091,13 +1330,50 @@ void update(double time) {
   }
 
   // --- ImGui Интерфейс ---
-  ImGui::Begin("Lab 3: Texture Mapping & Sampling (Grade 4)");
+  ImGui::Begin("Lab 4: Shadow Mapping (Grade 4)");
 
-  ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.4f, 1.0f), "Tasks: Base + Add. 1 & 2 (Grade 4)");
+  ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.4f, 1.0f), "Vulkan 1.3 Dynamic Rendering + sampler2DShadow");
   ImGui::Separator();
 
-  // 1. Выбор текстуры и материала (Доп. задание 1)
-  if (ImGui::CollapsingHeader("1. Texture Selection (Task 1)", ImGuiTreeNodeFlags_DefaultOpen)) {
+  // 1. Управление теневой картой и проекцией света (Лаб 4)
+  if (ImGui::CollapsingHeader("1. Shadow Mapping & Coverage (Lab 4)", ImGuiTreeNodeFlags_DefaultOpen)) {
+    ImGui::TextDisabled("Orthographic Projection Coverage:");
+    ImGui::SliderFloat("Ortho Half-Extent", &shadowOrthoSize, 1.5f, 15.0f, "%.1f m");
+    float coverageWidth = shadowOrthoSize * 2.0f;
+    float coverageArea = coverageWidth * coverageWidth;
+    ImGui::Text("Frustum Dimensions: %.1f m x %.1f m", coverageWidth, coverageWidth);
+    ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.6f, 1.0f), "Coverage Area: %.1f m^2", coverageArea);
+
+    ImGui::SliderFloat("Light Distance", &shadowLightDistance, 4.0f, 25.0f, "%.1f m");
+    ImGui::SliderFloat("Light Near Plane", &shadowNear, 0.1f, 5.0f, "%.1f m");
+    ImGui::SliderFloat("Light Far Plane", &shadowFar, 10.0f, 50.0f, "%.1f m");
+
+    ImGui::Separator();
+    ImGui::TextDisabled("Depth Bias (Acne Prevention):");
+    ImGui::SliderFloat("Hardware Constant Bias", &depthBiasConstant, 0.0f, 10.0f, "%.2f");
+    ImGui::SliderFloat("Hardware Slope Bias", &depthBiasSlope, 0.0f, 10.0f, "%.2f");
+    ImGui::SliderFloat("Shader Depth Bias", &shaderBias, 0.0f, 0.01f, "%.5f");
+
+    ImGui::Separator();
+    ImGui::TextDisabled("Floor Plane (Shadow Receiver):");
+    ImGui::SliderFloat("Floor Height (Y)", &floorY, -3.0f, 0.0f, "%.2f");
+    if (!textures.empty()) {
+      if (ImGui::BeginCombo("Floor Texture", textures[floorTexture].name.c_str())) {
+        for (int i = 0; i < (int)textures.size(); ++i) {
+          bool isSel = (floorTexture == i);
+          if (ImGui::Selectable(textures[i].name.c_str(), isSel)) {
+            floorTexture = i;
+          }
+          if (isSel) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+      }
+    }
+    ImGui::ColorEdit3("Floor Color Tint", floorColor);
+  }
+
+  // 2. Выбор текстуры и материала модели
+  if (ImGui::CollapsingHeader("2. Model Texture & Material", ImGuiTreeNodeFlags_DefaultOpen)) {
     if (!textures.empty()) {
       if (ImGui::BeginCombo("Active Texture", textures[selectedTexture].name.c_str())) {
         for (int i = 0; i < static_cast<int>(textures.size()); ++i) {
@@ -1117,8 +1393,8 @@ void update(double time) {
     ImGui::SliderFloat("Shininess", &matShininess, 1.0f, 128.0f, "%.1f");
   }
 
-  // 2. Нетривиальное сэмплирование (Доп. задание 2)
-  if (ImGui::CollapsingHeader("2. Non-Trivial Sampling & Effects (Task 2)", ImGuiTreeNodeFlags_DefaultOpen)) {
+  // 3. Нетривиальное сэмплирование (из Лаб 3)
+  if (ImGui::CollapsingHeader("3. Non-Trivial Sampling & Effects", ImGuiTreeNodeFlags_DefaultOpen)) {
     ImGui::Checkbox("Enable Non-Trivial Sampling", &enableNonTrivialSampling);
     if (enableNonTrivialSampling) {
       ImGui::SliderFloat("Wave Distortion (UV)", &waveDistortion, 0.0f, 3.0f, "%.2fx");
@@ -1127,8 +1403,8 @@ void update(double time) {
     }
   }
 
-  // 3. Камера
-  if (ImGui::CollapsingHeader("3. Camera Controls", ImGuiTreeNodeFlags_DefaultOpen)) {
+  // 4. Камера
+  if (ImGui::CollapsingHeader("4. Camera Controls", ImGuiTreeNodeFlags_DefaultOpen)) {
     ImGui::DragFloat3("Camera Position", glm::value_ptr(camPos), 0.05f);
     ImGui::SliderFloat("Yaw (Rotation Y)", &camYaw, -180.0f, 180.0f, "%.1f deg");
     ImGui::SliderFloat("Pitch (Tilt)", &camPitch, -89.0f, 89.0f, "%.1f deg");
@@ -1141,8 +1417,8 @@ void update(double time) {
     }
   }
 
-  // 4. Модель и трансформация
-  if (ImGui::CollapsingHeader("4. Model Transforms", ImGuiTreeNodeFlags_DefaultOpen)) {
+  // 5. Модель и анимация
+  if (ImGui::CollapsingHeader("5. Model Transforms", ImGuiTreeNodeFlags_DefaultOpen)) {
     ImGui::DragFloat3("Position", glm::value_ptr(modelPos), 0.05f);
     ImGui::SliderFloat3("Rotation", glm::value_ptr(modelRot), -180.0f, 180.0f, "%.1f deg");
     ImGui::DragFloat3("Scale", glm::value_ptr(modelScale), 0.05f, 0.1f, 4.0f);
@@ -1157,14 +1433,14 @@ void update(double time) {
     ImGui::SliderFloat("Speed", &animSpeed, 0.0f, 3.0f, "%.2fx");
   }
 
-  // 5. Освещение (Ambient, Directional, Point, Spot)
-  if (ImGui::CollapsingHeader("5. Lighting (Blinn-Phong)", ImGuiTreeNodeFlags_DefaultOpen)) {
+  // 6. Освещение (Ambient, Directional, Point, Spot)
+  if (ImGui::CollapsingHeader("6. Lighting (Blinn-Phong)", ImGuiTreeNodeFlags_DefaultOpen)) {
     ImGui::TextDisabled("Ambient Light:");
     ImGui::ColorEdit3("Ambient Color", ambientColor);
     ImGui::SliderFloat("Ambient Intensity", &ambientIntensity, 0.0f, 1.0f, "%.2f");
 
     ImGui::Separator();
-    ImGui::TextDisabled("Directional Light:");
+    ImGui::TextDisabled("Directional Light (Sun - Casts Shadow):");
     ImGui::Checkbox("Enable Directional Light", &dirLightEnabled);
     if (dirLightEnabled) {
       ImGui::SliderFloat3("Direction", dirLightDir, -1.0f, 1.0f);
@@ -1229,11 +1505,11 @@ void update(double time) {
   float aspect = (float)ctx.swapchain_extent.width /
                  (float)(ctx.swapchain_extent.height > 0 ? ctx.swapchain_extent.height : 1);
 
-  // Матрица проекции (инверсия Y под Vulkan)
+  // Матрица проекции камеры (инверсия Y под Vulkan)
   glm::mat4 projMat = glm::perspective(glm::radians(camFov), aspect, 0.1f, 100.0f);
   projMat[1][1] *= -1.0f;
 
-  // Матрица вида
+  // Матрица вида камеры
   float yawRad = glm::radians(camYaw);
   float pitchRad = glm::radians(camPitch);
   glm::vec3 front;
@@ -1255,7 +1531,7 @@ void update(double time) {
     animRotY = t * 0.8f;
   }
 
-  // Матрица модели: M = T * R * S
+  // Матрица модели 0 (параллелепипед): M = T * R * S
   glm::mat4 modelMat = glm::mat4(1.0f);
   modelMat = glm::translate(modelMat, modelPos + animPos);
   modelMat = glm::rotate(modelMat, glm::radians(modelRot.x), glm::vec3(1.0f, 0.0f, 0.0f));
@@ -1264,6 +1540,20 @@ void update(double time) {
   modelMat = glm::scale(modelMat, modelScale);
 
   glm::mat4 normalMatrix = computeNormalMatrix(modelMat);
+
+  // Расчет матрицы вида и ортографической проекции для направленного света (Солнца)
+  glm::vec3 sunDir = glm::normalize(glm::vec3(dirLightDir[0], dirLightDir[1], dirLightDir[2]));
+  glm::vec3 lightTarget = glm::vec3(0.0f, 0.0f, 0.0f);
+  glm::vec3 lightPos = lightTarget - sunDir * shadowLightDistance;
+  glm::vec3 up = std::abs(sunDir.y) > 0.99f ? glm::vec3(0.0f, 0.0f, 1.0f) : glm::vec3(0.0f, 1.0f, 0.0f);
+  glm::mat4 lightView = glm::lookAt(lightPos, lightTarget, up);
+
+  glm::mat4 lightProj = glm::ortho(-shadowOrthoSize, shadowOrthoSize,
+                                   -shadowOrthoSize, shadowOrthoSize,
+                                   shadowNear, shadowFar);
+  lightProj[1][1] *= -1.0f; // инверсия Y под Vulkan clip space
+
+  glm::mat4 shadowViewProj = lightProj * lightView;
 
   // -------------------------------------------------------------
   // Отправка данных в буферы GPU
@@ -1274,21 +1564,33 @@ void update(double time) {
   sceneUbo.view = viewMat;
   sceneUbo.proj = projMat;
   sceneUbo.viewProj = projMat * viewMat;
+  sceneUbo.shadowViewProj = shadowViewProj;
   sceneUbo.cameraPos = glm::vec4(camPos, 1.0f);
   sceneUbo.ambientLight = glm::vec4(ambientColor[0], ambientColor[1], ambientColor[2], ambientIntensity);
-  sceneUbo.dirLightDir = glm::vec4(glm::normalize(glm::vec3(dirLightDir[0], dirLightDir[1], dirLightDir[2])), dirLightIntensity);
+  sceneUbo.dirLightDir = glm::vec4(sunDir, dirLightIntensity);
   sceneUbo.dirLightColor = glm::vec4(dirLightColor[0], dirLightColor[1], dirLightColor[2], dirLightEnabled ? 1.0f : 0.0f);
+  sceneUbo.shadowParams = glm::vec4(depthBiasConstant, depthBiasSlope, shadowOrthoSize, shaderBias);
   sceneUbo.numPointLights = (int)pointLightsList.size();
   sceneUbo.numSpotLights = (int)spotLightsList.size();
   copyToBuffer(sceneUboAlloc, &sceneUbo, sizeof(sceneUbo));
 
-  // 2. Dynamic Model UBO (смещение 0 для модели 0)
+  // 2. Dynamic Model UBO
+  // Модель 0: параллелепипед (смещение 0)
   ModelUniforms modelUbo = {};
   modelUbo.model = modelMat;
   modelUbo.normalMatrix = normalMatrix;
   modelUbo.albedo = glm::vec4(matAlbedoTint[0], matAlbedoTint[1], matAlbedoTint[2], 1.0f);
   modelUbo.specular = glm::vec4(matSpecular[0], matSpecular[1], matSpecular[2], matShininess);
   copyToBuffer(modelUboAlloc, &modelUbo, sizeof(modelUbo), 0);
+
+  // Модель 1: плоскость пола (смещение dynamicAlignment)
+  glm::mat4 floorMat = glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, floorY, 0.0f));
+  ModelUniforms floorUbo = {};
+  floorUbo.model = floorMat;
+  floorUbo.normalMatrix = computeNormalMatrix(floorMat);
+  floorUbo.albedo = glm::vec4(floorColor[0], floorColor[1], floorColor[2], 1.0f);
+  floorUbo.specular = glm::vec4(0.2f, 0.2f, 0.2f, 16.0f);
+  copyToBuffer(modelUboAlloc, &floorUbo, sizeof(floorUbo), dynamicAlignment);
 
   // 3. Point Lights Storage Buffer
   if (!pointLightsList.empty()) {
@@ -1331,6 +1633,108 @@ void render(const graphics::internal::FrameData &frame) {
   beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
   vkBeginCommandBuffer(cmd, &beginInfo);
 
+  // =============================================================
+  // ПРОХОД 1: Генерация карты теней через Dynamic Rendering (Vulkan 1.3)
+  // =============================================================
+
+  // Перевод изображения глубины в оптимальный формат для записи (DEPTH_ATTACHMENT_OPTIMAL)
+  VkImageMemoryBarrier barrierToDepth = {};
+  barrierToDepth.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+  barrierToDepth.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  barrierToDepth.newLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+  barrierToDepth.srcAccessMask = 0;
+  barrierToDepth.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+  barrierToDepth.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  barrierToDepth.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  barrierToDepth.image = shadowImage;
+  barrierToDepth.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+  barrierToDepth.subresourceRange.baseMipLevel = 0;
+  barrierToDepth.subresourceRange.levelCount = 1;
+  barrierToDepth.subresourceRange.baseArrayLayer = 0;
+  barrierToDepth.subresourceRange.layerCount = 1;
+
+  vkCmdPipelineBarrier(cmd,
+      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+      VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+      0, 0, nullptr, 0, nullptr, 1, &barrierToDepth);
+
+  // Настройка аттачмента глубины для Dynamic Rendering (Lecture 8 Slide 17)
+  VkRenderingAttachmentInfo depthAttachment = {};
+  depthAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+  depthAttachment.imageView = shadowImageView;
+  depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+  depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+  depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  depthAttachment.clearValue.depthStencil = {1.0f, 0};
+
+  VkRenderingInfo renderingInfo = {};
+  renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+  renderingInfo.renderArea = {{0, 0}, {SHADOW_MAP_SIZE, SHADOW_MAP_SIZE}};
+  renderingInfo.layerCount = 1;
+  renderingInfo.pDepthAttachment = &depthAttachment;
+
+  pfnCmdBeginRendering(cmd, &renderingInfo);
+
+  VkViewport shadowVp = {0.0f, 0.0f, (float)SHADOW_MAP_SIZE, (float)SHADOW_MAP_SIZE, 0.0f, 1.0f};
+  vkCmdSetViewport(cmd, 0, 1, &shadowVp);
+
+  VkRect2D shadowSc = {{0, 0}, {SHADOW_MAP_SIZE, SHADOW_MAP_SIZE}};
+  vkCmdSetScissor(cmd, 0, 1, &shadowSc);
+
+  // Установка аппаратного сдвига глубины (depth bias) для предотвращения артефактов (acne)
+  vkCmdSetDepthBias(cmd, depthBiasConstant, 0.0f, depthBiasSlope);
+
+  // Привязываем конвейер теней
+  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, shadowPipeline);
+
+  VkBuffer vbs[] = {vertBuffer};
+  VkDeviceSize offsets[] = {0};
+  vkCmdBindVertexBuffers(cmd, 0, 1, vbs, offsets);
+  vkCmdBindIndexBuffer(cmd, idxBuffer, 0, VK_INDEX_TYPE_UINT16);
+
+  // Привязываем Set 0 (Сцена: содержит shadowViewProj)
+  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeLayout, 0, 1, &descSetScene, 0, nullptr);
+
+  // Отрисовка модели 0 (параллелепипед) в карту теней
+  uint32_t dynOffset0 = 0;
+  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeLayout, 1, 1,
+                          &descSetsModel[selectedTexture], 1, &dynOffset0);
+  vkCmdDrawIndexed(cmd, cubeIndexCount, 1, cubeIndexOffset, 0, 0);
+
+  // Отрисовка модели 1 (пол) в карту теней
+  uint32_t dynOffset1 = static_cast<uint32_t>(dynamicAlignment);
+  int activeFloorTex = (floorTexture >= 0 && floorTexture < (int)textures.size()) ? floorTexture : 0;
+  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeLayout, 1, 1,
+                          &descSetsModel[activeFloorTex], 1, &dynOffset1);
+  vkCmdDrawIndexed(cmd, floorIndexCount, 1, floorIndexOffset, 0, 0);
+
+  pfnCmdEndRendering(cmd);
+
+  // Перевод изображения глубины в оптимальный формат для сэмплирования в шейдере (Lecture 8 Slide 22)
+  VkImageMemoryBarrier barrierToRead = {};
+  barrierToRead.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+  barrierToRead.oldLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+  barrierToRead.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  barrierToRead.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+  barrierToRead.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+  barrierToRead.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  barrierToRead.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  barrierToRead.image = shadowImage;
+  barrierToRead.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+  barrierToRead.subresourceRange.baseMipLevel = 0;
+  barrierToRead.subresourceRange.levelCount = 1;
+  barrierToRead.subresourceRange.baseArrayLayer = 0;
+  barrierToRead.subresourceRange.layerCount = 1;
+
+  vkCmdPipelineBarrier(cmd,
+      VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+      0, 0, nullptr, 0, nullptr, 1, &barrierToRead);
+
+  // =============================================================
+  // ПРОХОД 2: Отрисовка основной сцены в swapchain framebuffer
+  // =============================================================
+
   VkClearValue clears[2] = {};
   clears[0].color = {{0.08f, 0.09f, 0.11f, 1.0f}};
   clears[1].depthStencil = {1.0f, 0};
@@ -1356,26 +1760,20 @@ void render(const graphics::internal::FrameData &frame) {
   sc.extent = ctx.swapchain_extent;
   vkCmdSetScissor(cmd, 0, 1, &sc);
 
-  // Привязываем буфер вершин из чистой VRAM
-  VkBuffer vbs[] = {vertBuffer};
-  VkDeviceSize offsets[] = {0};
+  // Привязываем буферы геометрии
   vkCmdBindVertexBuffers(cmd, 0, 1, vbs, offsets);
-
-  // Привязываем буфер индексов из чистой VRAM
   vkCmdBindIndexBuffer(cmd, idxBuffer, 0, VK_INDEX_TYPE_UINT16);
 
-  // Привязываем графический конвейер
+  // Привязываем основной графический конвейер
   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
 
-  // Привязываем Set 0 (Сцена: без динамических смещений)
+  // Привязываем Set 0 (Сцена: содержит матрицу теней и сэмплер sampler2DShadow в binding 3)
   vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeLayout, 0, 1, &descSetScene, 0, nullptr);
 
-  // Привязываем Set 1 (Материал с выбранной текстурой + динамический UBO модели со смещением)
-  uint32_t dynamicOffset = 0; // Смещение модели 0 в Dynamic Uniform Buffer
+  // 1. Отрисовка параллелепипеда (Модель 0)
   vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeLayout, 1, 1,
-                          &descSetsModel[selectedTexture], 1, &dynamicOffset);
+                          &descSetsModel[selectedTexture], 1, &dynOffset0);
 
-  // Передаем параметры нетривиального сэмплирования через Push Constants (Доп. задание 2)
   PushConstants pc{};
   pc.enableEffects = enableNonTrivialSampling ? 1 : 0;
   pc.time = static_cast<float>(animTime);
@@ -1384,9 +1782,21 @@ void render(const graphics::internal::FrameData &frame) {
   pc.colorModulation = colorModulation;
 
   vkCmdPushConstants(cmd, pipeLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(PushConstants), &pc);
+  vkCmdDrawIndexed(cmd, cubeIndexCount, 1, cubeIndexOffset, 0, 0);
 
-  // Отрисовка параллелепипеда
-  vkCmdDrawIndexed(cmd, (uint32_t)indices.size(), 1, 0, 0, 0);
+  // 2. Отрисовка пола (Модель 1) — принимает тень от параллелепипеда!
+  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeLayout, 1, 1,
+                          &descSetsModel[activeFloorTex], 1, &dynOffset1);
+
+  PushConstants pcFloor{};
+  pcFloor.enableEffects = 0; // на полу стандартное четкое отображение сетки/текстуры
+  pcFloor.time = 0.0f;
+  pcFloor.waveDistortion = 0.0f;
+  pcFloor.chromaticAberr = 0.0f;
+  pcFloor.colorModulation = 0.0f;
+
+  vkCmdPushConstants(cmd, pipeLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(PushConstants), &pcFloor);
+  vkCmdDrawIndexed(cmd, floorIndexCount, 1, floorIndexOffset, 0, 0);
 
   vkCmdEndRenderPass(cmd);
   vkEndCommandBuffer(cmd);
